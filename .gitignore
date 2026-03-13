@@ -1,25 +1,13 @@
-# Python
+# --- DATA FOLDER ---
+# We want the main folder and Dataset.csv
+# But we EXCLUDE the heavy extra folder
+data/extra/
+
+# --- PROJECT JUNK (Exclude) ---
+# These are temporary files that clutter your repo
 __pycache__/
-*.pyc
-*.pyo
-
-# Jupyter
 .ipynb_checkpoints/
-
-# Environment
+.vscode/
 .env
-
-# Conda
-env/
-.conda/
-
-# Data and models
-data/
-models/
-
-# OS junk
 .DS_Store
 Thumbs.db
-
-# VS Code
-.vscode/
