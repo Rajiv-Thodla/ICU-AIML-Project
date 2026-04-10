@@ -1,0 +1,16 @@
+# ICU Deterioration Monitor — Python dependencies
+# Install with:  pip install -r requirements.txt
+
+# Core
+numpy>=1.24
+pandas>=2.0
+scikit-learn>=1.3
+joblib>=1.3
+
+# Models
+xgboost>=2.0
+tensorflow>=2.13        # for LSTM (Keras)
+torch>=2.0              # for GRU
+
+# App
+streamlit>=1.32
