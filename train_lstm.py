@@ -12,7 +12,7 @@ import joblib
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, recall_score
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.layers import Input, LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
 
 from preprocess import load_and_clean_data, create_sequences, fit_scaler, apply_scaler, WINDOW
@@ -54,7 +54,8 @@ X_test_s  = X_test_2d.reshape(-1, seq_len, n_feat)
 # 5. Build model (This is what went missing!)
 # ---------------------------------------------------------------------------
 model = Sequential([
-    LSTM(64, input_shape=(seq_len, n_feat), return_sequences=True),
+    Input(shape=(seq_len, n_feat)),
+    LSTM(64, return_sequences=True),
     Dropout(0.2),
     LSTM(32),
     Dropout(0.2),
@@ -107,7 +108,7 @@ print(f"F1 Score : {f1_score(y_test, y_pred):.4f}")
 # ---------------------------------------------------------------------------
 # 8. Save
 # ---------------------------------------------------------------------------
-model.save(os.path.join(args.out, "lstm_model.h5"))
+model.save(os.path.join(args.out, "lstm_model.keras"))
 joblib.dump(scaler, os.path.join(args.out, "lstm_scaler.joblib"))
 
 meta = {"feature_cols": feature_cols, "seq_len": seq_len, "n_feat": n_feat}

@@ -4,16 +4,7 @@ app.py  —  ICU Patient Deterioration Prediction — Streamlit Frontend
 Usage:
     streamlit run app.py
 
-Requires the models/ directory to contain the artifacts produced by:
-    python train_xgb.py  --data /path/to/data.csv
-    python train_lstm.py --data /path/to/data.csv
-    python train_gru.py  --data /path/to/data.csv
-
-Folder layout expected:
-    models/
-        xgb_model.joblib    xgb_scaler.joblib   xgb_features.json
-        lstm_model.h5       lstm_scaler.joblib   lstm_meta.json
-        gru_model.pt        gru_scaler.joblib    gru_meta.json
+Requires the models/ directory to contain the artifacts produced by the training scripts.
 """
 
 import json
@@ -111,7 +102,6 @@ st.markdown("""
 # ═══════════════════════════════════════════════════════════════════════════
 MODELS_DIR = "models"
 
-
 @st.cache_resource(show_spinner="Loading model…")
 def load_xgb():
     model_path   = os.path.join(MODELS_DIR, "xgb_model.joblib")
@@ -176,6 +166,111 @@ def load_gru():
     scaler = joblib.load(scaler_path)
     return model, scaler, meta
 
+@st.cache_resource(show_spinner="Loading model…")
+def load_tcn():
+    import torch
+    import torch.nn as nn
+
+    class TemporalBlock(nn.Module):
+        def __init__(self, in_channels, out_channels, kernel_size, dilation, dropout):
+            super().__init__()
+            padding = (kernel_size - 1) * dilation
+            self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, padding=padding, dilation=dilation)
+            self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, padding=padding, dilation=dilation)
+            self.relu = nn.ReLU()
+            self.dropout = nn.Dropout(dropout)
+            self.downsample = nn.Conv1d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else None
+
+        def forward(self, x):
+            out = self.conv1(x)
+            out = out[:, :, :x.size(2)]
+            out = self.relu(out)
+            out = self.dropout(out)
+            out = self.conv2(out)
+            out = out[:, :, :x.size(2)]
+            out = self.relu(out)
+            out = self.dropout(out)
+            residual = x if self.downsample is None else self.downsample(x)
+            return self.relu(out + residual)
+
+    class TCNModel(nn.Module):
+        def __init__(self, input_size, channels=[64, 64, 64], kernel_size=3, dropout=0.3):
+            super().__init__()
+            layers = []
+            for i, out_channels in enumerate(channels):
+                in_channels = input_size if i == 0 else channels[i - 1]
+                layers.append(TemporalBlock(in_channels, out_channels, kernel_size, dilation=2 ** i, dropout=dropout))
+            self.network = nn.Sequential(*layers)
+            self.fc = nn.Linear(channels[-1], 1)
+
+        def forward(self, x):
+            x = x.permute(0, 2, 1)
+            out = self.network(x)
+            out = out[:, :, -1]
+            return self.fc(out)
+
+    model_path  = os.path.join(MODELS_DIR, "tcn_model.pt")
+    scaler_path = os.path.join(MODELS_DIR, "tcn_scaler.joblib")
+    meta_path   = os.path.join(MODELS_DIR, "tcn_meta.json")
+    
+    if not all(os.path.exists(p) for p in [model_path, scaler_path, meta_path]):
+        return None, None, None
+
+    with open(meta_path) as f:
+        meta = json.load(f)
+
+    model = TCNModel(input_size=meta["n_feat"])
+    model.load_state_dict(torch.load(model_path, map_location="cpu"))
+    model.eval()
+
+    scaler = joblib.load(scaler_path)
+    return model, scaler, meta
+
+# --- ARIMA MATH HELPERS ---
+def ar1_coeff(series):
+    if len(series) < 3: return 0.0
+    mean = np.mean(series)
+    centered = series - mean
+    c0 = np.sum(centered ** 2)
+    if c0 == 0: return 0.0
+    return np.sum(centered[:-1] * centered[1:]) / c0
+
+def extract_arima_features(window_data, vital_cols):
+    feat = {}
+    t = np.arange(len(window_data), dtype=np.float64)
+    for idx, col in enumerate(vital_cols):
+        s = window_data[:, idx].astype(np.float64)
+        feat[f"{col}_mean"]  = np.mean(s)
+        feat[f"{col}_std"]   = np.std(s)
+        feat[f"{col}_min"]   = np.min(s)
+        feat[f"{col}_max"]   = np.max(s)
+        feat[f"{col}_last"]  = s[-1]
+        feat[f"{col}_range"] = np.ptp(s)
+        phi = ar1_coeff(s)
+        feat[f"{col}_ar1"] = phi
+        residuals = s[1:] - phi * s[:-1]
+        feat[f"{col}_resid_var"] = np.var(residuals) if len(residuals) > 0 else 0.0
+        feat[f"{col}_ma1"] = ar1_coeff(residuals) if len(residuals) >= 3 else 0.0
+        feat[f"{col}_trend"] = np.polyfit(t, s, 1)[0] if np.std(s) > 0 else 0.0
+        mu = np.mean(s)
+        forecast = mu + phi * (s[-1] - mu)
+        feat[f"{col}_forecast1"] = forecast
+        feat[f"{col}_forecast_delta"] = forecast - s[-1]
+    return feat
+
+@st.cache_resource(show_spinner="Loading model…")
+def load_arima():
+    model_path   = os.path.join(MODELS_DIR, "arima_model.joblib")
+    scaler_path  = os.path.join(MODELS_DIR, "arima_scaler.joblib")
+    meta_path    = os.path.join(MODELS_DIR, "arima_meta.json")
+    if not all(os.path.exists(p) for p in [model_path, scaler_path, meta_path]):
+        return None, None, None
+    model  = joblib.load(model_path)
+    scaler = joblib.load(scaler_path)
+    with open(meta_path) as f:
+        meta = json.load(f)
+    return model, scaler, meta
+
 
 def model_available(name):
     """Check whether a model's files exist on disk."""
@@ -183,6 +278,8 @@ def model_available(name):
         "XGBoost": ["xgb_model.joblib", "xgb_scaler.joblib", "xgb_features.json"],
         "LSTM":    ["lstm_model.h5",     "lstm_scaler.joblib", "lstm_meta.json"],
         "GRU":     ["gru_model.pt",      "gru_scaler.joblib",  "gru_meta.json"],
+        "TCN":     ["tcn_model.pt",      "tcn_scaler.joblib",  "tcn_meta.json"],
+        "ARIMA":   ["arima_model.joblib", "arima_scaler.joblib", "arima_meta.json"],
     }
     return all(os.path.exists(os.path.join(MODELS_DIR, f)) for f in files[name])
 
@@ -198,23 +295,37 @@ def predict_xgb(model, scaler, feature_names, hourly_rows):
     prob  = model.predict_proba(row_s)[0, 1]
     return float(prob)
 
+def predict_arima(model, scaler, feature_names, hourly_rows):
+    df = pd.DataFrame(hourly_rows)
+    vital_data = df[VITAL_COLS].values 
+    feat_dict = extract_arima_features(vital_data, VITAL_COLS)
+    row = pd.DataFrame([feat_dict])[feature_names]
+    row_s = scaler.transform(row)
+    prob  = model.predict_proba(row_s)[0, 1]
+    return float(prob)
 
 def predict_sequence_model(model, scaler, feature_cols, hourly_rows, model_type):
-    """Shared inference for LSTM and GRU."""
+    """Shared inference for sequence models."""
     X = build_manual_sequence(hourly_rows, feature_cols, scaler)  # (1, T, F)
     if model_type == "LSTM":
         prob = float(model.predict(X, verbose=0)[0, 0])
-    else:  # GRU (PyTorch)
+    else:  # GRU or TCN (PyTorch)
         import torch
         with torch.no_grad():
             t = torch.tensor(X, dtype=torch.float32)
             prob = float(model(t)[0, 0].item())
+            
+            # Ensure TCN logits are passed through sigmoid if it lacks one in the final layer
+            if model_type == "TCN":
+                prob = float(torch.sigmoid(torch.tensor(prob)).item())
+                
     return prob
 
-def risk_label(prob):
-    if prob >= 0.60: # High Risk
+def risk_label(prob, threshold):
+    """Dynamically labels risk based on the user-selected threshold."""
+    if prob >= threshold: # High Risk
         return "HIGH", "badge-high", "risk-high"
-    elif prob >= 0.30: # Changed from 0.35 to match your training threshold
+    elif prob >= (threshold - 0.20): # Buffer zone for moderate risk
         return "MODERATE", "badge-medium", "risk-medium"
     else:
         return "LOW", "badge-low", "risk-low"
@@ -230,18 +341,40 @@ with st.sidebar:
 
     st.markdown('<div class="section-header">Model Selection</div>', unsafe_allow_html=True)
 
-    available = [m for m in ["XGBoost", "LSTM", "GRU"] if model_available(m)]
+    available = [m for m in ["XGBoost", "LSTM", "GRU", "TCN", "ARIMA"] if model_available(m)]
     if not available:
         st.error("No trained models found in `models/`.\nRun the training scripts first.")
-        st.code("python train_xgb.py  --data data.csv\npython train_lstm.py --data data.csv\npython train_gru.py  --data data.csv")
+        st.code("python train_xgb.py  --data data.csv\npython train_lstm.py --data data.csv\npython train_gru.py  --data data.csv\npython train_tcn.py  --data data.csv")
         st.stop()
 
     model_choice = st.selectbox("Active model", available)
 
-    for m in ["XGBoost", "LSTM", "GRU"]:
+    for m in ["XGBoost", "LSTM", "GRU", "TCN", "ARIMA"]:
         icon = "✅" if model_available(m) else "⬜"
         st.markdown(f"{icon} {m}")
 
+    st.markdown("---")
+    # NEW FEATURE: Dynamic Threshold Slider
+    st.markdown('<div class="section-header">⚙️ Clinical Settings</div>', unsafe_allow_html=True)
+    
+    # Define the mathematically optimal thresholds for each model
+    optimal_thresholds = {
+        "GRU": 0.80,
+        "TCN": 0.30,
+        "LSTM": 0.30,
+        "XGBoost": 0.30,
+        "ARIMA": 0.30
+    }
+    
+    user_threshold = st.slider(
+        "Alarm Sensitivity (Threshold)", 
+        min_value=0.10, 
+        max_value=0.90, 
+        value=optimal_thresholds[model_choice], # Automatically updates based on selection
+        step=0.05,
+        help="Lower values catch more cases but increase False Alarms."
+    )
+    
     st.markdown("---")
     st.markdown('<div class="section-header">About</div>', unsafe_allow_html=True)
     st.caption(
@@ -274,12 +407,19 @@ st.markdown(f"""
 
 if model_choice == "XGBoost":
     mdl, scaler, meta = load_xgb()
+    feature_cols = meta
 elif model_choice == "LSTM":
     mdl, scaler, meta = load_lstm()
-else:
+    feature_cols = meta["feature_cols"]
+elif model_choice == "GRU":
     mdl, scaler, meta = load_gru()
-
-feature_cols = meta if model_choice == "XGBoost" else meta["feature_cols"]
+    feature_cols = meta["feature_cols"]
+elif model_choice == "ARIMA":
+    mdl, scaler, meta = load_arima()
+    feature_cols = meta["arima_feature_cols"]
+else:
+    mdl, scaler, meta = load_tcn()
+    feature_cols = meta["feature_cols"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -343,12 +483,15 @@ with tab_csv:
 
                     if model_choice == "XGBoost":
                         prob = predict_xgb(mdl, scaler, feature_cols, hourly_rows)
+                    elif model_choice == "ARIMA":
+                        prob = predict_arima(mdl, scaler, feature_cols, hourly_rows)
                     else:
                         prob = predict_sequence_model(
                             mdl, scaler, feature_cols, hourly_rows, model_choice
                         )
 
-                label, badge_cls, card_cls = risk_label(prob)
+                # DYNAMIC LOGIC PASSED HERE
+                label, badge_cls, card_cls = risk_label(prob, user_threshold)
 
                 st.markdown("---")
                 st.markdown("### Prediction Result")
@@ -376,7 +519,7 @@ with tab_csv:
                     </div>""", unsafe_allow_html=True)
 
                 if label == "HIGH":
-                    st.error("⚠️  High deterioration risk detected. Consider immediate clinical review.")
+                    st.error(f"⚠️  Risk score exceeds your {user_threshold:.2f} threshold. Consider immediate clinical review.")
                 elif label == "MODERATE":
                     st.warning("⚡  Moderate risk. Recommend increased monitoring frequency.")
                 else:
@@ -398,6 +541,8 @@ with tab_csv:
                         window_rows = rows_all[i - WINDOW : i]
                         if model_choice == "XGBoost":
                             p = predict_xgb(mdl, scaler, feature_cols, window_rows)
+                        elif model_choice == "ARIMA":
+                            p = predict_arima(mdl, scaler, feature_cols, window_rows)
                         else:
                             p = predict_sequence_model(mdl, scaler, feature_cols,
                                                        window_rows, model_choice)
@@ -498,12 +643,15 @@ with tab_manual:
 
                 if model_choice == "XGBoost":
                     prob = predict_xgb(mdl, scaler, feature_cols, window_rows)
+                elif model_choice == "ARIMA":
+                    prob = predict_arima(mdl, scaler, feature_cols, window_rows)
                 else:
                     prob = predict_sequence_model(
                         mdl, scaler, feature_cols, window_rows, model_choice
                     )
 
-            label, badge_cls, card_cls = risk_label(prob)
+            # DYNAMIC LOGIC PASSED HERE
+            label, badge_cls, card_cls = risk_label(prob, user_threshold)
 
             st.markdown("---")
             st.markdown("### Prediction Result")
@@ -531,7 +679,7 @@ with tab_manual:
                 </div>""", unsafe_allow_html=True)
 
             if label == "HIGH":
-                st.error("⚠️  High deterioration risk detected. Consider immediate clinical review.")
+                st.error(f"⚠️  Risk score exceeds your {user_threshold:.2f} threshold. Consider immediate clinical review.")
             elif label == "MODERATE":
                 st.warning("⚡  Moderate risk. Recommend increased monitoring frequency.")
             else:
